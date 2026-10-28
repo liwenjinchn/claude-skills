@@ -107,12 +107,18 @@ def transcribe(audio, model, offset=0):
 def split_audio(audio, chunk_dir, chunk_seconds):
     chunk_dir.mkdir(parents=True, exist_ok=True)
     ext = pathlib.Path(audio).suffix or ".m4a"
+    # A previous failed split may have left partial or stale chunks.
+    for chunk in chunk_dir.glob(f"chunk-*{ext}"):
+        chunk.unlink()
     pattern = str(chunk_dir / f"chunk-%05d{ext}")
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", audio,
         "-f", "segment", "-segment_time", str(chunk_seconds), "-c", "copy", pattern,
     ], check=True)
-    return sorted(chunk_dir.glob("chunk-*.m4a"))
+    chunks = sorted(chunk_dir.glob(f"chunk-*{ext}"))
+    if not chunks:
+        raise RuntimeError("音频分段失败：FFmpeg 未生成任何分段")
+    return chunks
 
 
 def save_segments(path, segs):
@@ -130,10 +136,22 @@ def transcribe_long(audio, title, source, model, out, duration, chunk_minutes):
     segment_dir = workdir / "segments"
     segment_dir.mkdir(parents=True, exist_ok=True)
     partial = out.with_suffix(".partial.md")
+    try:
+        previous_status = json.loads((workdir / "status.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        previous_status = {}
     write_status(workdir, state="splitting", source=source, title=title, duration_seconds=duration)
 
     chunk_seconds = max(1, int(chunk_minutes * 60))
-    chunks = sorted(chunk_dir.glob("chunk-*.*")) or split_audio(audio, chunk_dir, chunk_seconds)
+    ext = pathlib.Path(audio).suffix or ".m4a"
+    chunks = sorted(chunk_dir.glob(f"chunk-*{ext}"))
+    # Only reuse a cache known to have completed splitting. In particular,
+    # failed/interrupted FFmpeg runs and old zero-chunk 'done' states must retry.
+    if not (chunks and previous_status.get("state") in ("transcribing", "done")
+            and previous_status.get("total_chunks") == len(chunks)):
+        chunks = split_audio(audio, chunk_dir, chunk_seconds)
+    if not chunks:
+        raise RuntimeError("音频分段失败：没有可转录的分段")
     total = len(chunks)
     all_segs, engine = [], None
     default_engine = f"mlx-whisper/{model.split('/')[-1]}"
